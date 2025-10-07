@@ -1,6 +1,5 @@
 # site.yml — единый прогон кластера (Semaphore → Ansible)
-
-# Требуемые группы в inventory:
+# Инвентарь должен иметь группы:
 # [k8s_master]
 # [k8s_workers]
 # [k8s_all:children]
@@ -13,11 +12,8 @@
   become: yes
   gather_facts: yes
   vars:
-    # если хочешь получать kubeconfig не только для root, укажи
-    # фактическое имя своего пользователя тут или в group_vars/host_vars
-    cluster_admin_user: admin
-    k8s_major_minor: "v1.28"           # ветка Kubernetes для pkgs.k8s.io
-    pod_network_cidr: "10.244.0.0/16"  # Calico совместим
+    k8s_major_minor: "v1.28"           # версия ветки Kubernetes на pkgs.k8s.io
+    pod_network_cidr: "10.244.0.0/16"  # сеть подов (Calico)
   environment:
     DEBIAN_FRONTEND: noninteractive
   tasks:
@@ -88,7 +84,7 @@
         cache_valid_time: 0
         force_apt_get: yes
 
-    # ---- containerd (из Debian), полный конфиг + CRI + systemd cgroups ----
+    # ---- containerd (Debian), полный конфиг + CRI + systemd cgroups ----
     - name: Install containerd (Debian repo)
       ansible.builtin.apt:
         name: containerd
@@ -127,6 +123,7 @@
         content: |
           overlay
           br_netfilter
+
     - name: Load modules now
       ansible.builtin.shell: modprobe overlay && modprobe br_netfilter
       changed_when: false
@@ -138,6 +135,7 @@
           net.bridge.bridge-nf-call-iptables=1
           net.bridge.bridge-nf-call-ip6tables=1
           net.ipv4.ip_forward=1
+
     - name: Apply sysctl
       ansible.builtin.shell: sysctl --system
       changed_when: false
@@ -168,7 +166,6 @@
   hosts: k8s_master
   become: yes
   vars:
-    cluster_admin_user: "{{ cluster_admin_user | default('admin') }}"
     pod_network_cidr: "10.244.0.0/16"
   tasks:
     - name: kubeadm init (idempotent)
@@ -181,26 +178,34 @@
         creates: /etc/kubernetes/admin.conf
       register: init_out
 
-    # --- kubeconfig для root (всегда) ---
+    # kubeconfig всегда для root
     - name: Prepare kubeconfig for root
       ansible.builtin.shell: |
         install -d -m 0700 /root/.kube
         cp -f /etc/kubernetes/admin.conf /root/.kube/config
         chown root:root /root/.kube/config
 
-    # --- kubeconfig для cluster_admin_user (только если такой пользователь есть) ---
-    - name: Check if cluster_admin_user exists
-      ansible.builtin.shell: id -u {{ cluster_admin_user }}
+    # если хочешь ещё копию для «своего» пользователя — задавай переменную cluster_admin_user в inventory
+    - name: Compute effective_admin_user if provided
+      ansible.builtin.set_fact:
+        effective_admin_user: "{{ cluster_admin_user }}"
+      when: cluster_admin_user is defined and (cluster_admin_user | string | length) > 0
+
+    - name: Check if effective_admin_user exists
+      ansible.builtin.shell: id -u {{ effective_admin_user }}
       register: user_exists
       changed_when: false
       failed_when: false
+      when: effective_admin_user is defined
 
-    - name: Prepare kubeconfig for {{ cluster_admin_user }} (if exists)
-      when: user_exists.rc == 0
+    - name: Prepare kubeconfig for {{ effective_admin_user }} (if exists)
+      when:
+        - effective_admin_user is defined
+        - user_exists.rc == 0
       ansible.builtin.shell: |
-        install -d -m 0755 -o {{ cluster_admin_user }} -g {{ cluster_admin_user }} /home/{{ cluster_admin_user }}/.kube
-        cp -f /etc/kubernetes/admin.conf /home/{{ cluster_admin_user }}/.kube/config
-        chown {{ cluster_admin_user }}:{{ cluster_admin_user }} /home/{{ cluster_admin_user }}/.kube/config
+        install -d -m 0755 -o {{ effective_admin_user }} -g {{ effective_admin_user }} /home/{{ effective_admin_user }}/.kube
+        cp -f /etc/kubernetes/admin.conf /home/{{ effective_admin_user }}/.kube/config
+        chown {{ effective_admin_user }}:{{ effective_admin_user }} /home/{{ effective_admin_user }}/.kube/config
 
     - name: Obtain join command (with containerd socket)
       ansible.builtin.shell: kubeadm token create --print-join-command
