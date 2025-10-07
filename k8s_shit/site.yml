@@ -1,0 +1,142 @@
+- name: 01 Prepare all nodes
+  hosts: k8s_all
+  become: yes
+  vars:
+    k8s_version: "1.28.5"
+  tasks:
+    - name: Disable swap
+      shell: |
+        swapoff -a
+        sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+    - name: Load kernel modules
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+    - shell: modprobe overlay && modprobe br_netfilter
+
+    - name: Set sysctl
+      copy:
+        dest: /etc/sysctl.d/k8s.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables=1
+          net.bridge.bridge-nf-call-ip6tables=1
+          net.ipv4.ip_forward=1
+    - shell: sysctl --system
+
+    - name: Base pkgs
+      apt:
+        name: [apt-transport-https, ca-certificates, curl, gnupg, lsb-release]
+        state: present
+        update_cache: yes
+
+    - name: Docker GPG & repo
+      apt_key:
+        url: https://download.docker.com/linux/debian/gpg
+        state: present
+    - apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/debian {{ ansible_distribution_release }} stable"
+        state: present
+
+    - name: Install containerd
+      apt:
+        name: containerd.io
+        state: present
+        update_cache: yes
+
+    - name: containerd config (systemd cgroups)
+      copy:
+        dest: /etc/containerd/config.toml
+        content: |
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+            runtime_type = "io.containerd.runc.v2"
+            [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+              SystemdCgroup = true
+    - systemd: { name: containerd, state: restarted, enabled: yes }
+
+    - name: Kubernetes repo
+      apt_repository:
+        repo: "deb https://apt.kubernetes.io/ kubernetes-xenial main"
+        filename: kubernetes
+        state: present
+    - name: Install kubelet/kubeadm/kubectl {{ k8s_version }}
+      apt:
+        name:
+          - "kubelet={{ k8s_version }}-00"
+          - "kubeadm={{ k8s_version }}-00"
+          - "kubectl={{ k8s_version }}-00"
+        state: present
+        allow_downgrade: yes
+        update_cache: yes
+    - shell: apt-mark hold kubelet kubeadm kubectl
+    - systemd: { name: kubelet, state: started, enabled: yes }
+
+- name: 02 Init master
+  hosts: k8s_master
+  become: yes
+  vars:
+    k8s_version: "1.28.5"
+    pod_network_cidr: "10.244.0.0/16"
+  tasks:
+    - name: kubeadm init
+      shell: |
+        kubeadm init \
+          --pod-network-cidr={{ pod_network_cidr }} \
+          --service-cidr=10.96.0.0/12 \
+          --kubernetes-version v{{ k8s_version }} \
+          --apiserver-advertise-address {{ ansible_default_ipv4.address }}
+      args: { creates: /etc/kubernetes/admin.conf }
+
+    - name: kubeconfig for admin
+      shell: |
+        install -d -m 0755 -o admin -g admin /home/admin/.kube
+        cp -f /etc/kubernetes/admin.conf /home/admin/.kube/config
+        chown admin:admin /home/admin/.kube/config
+
+    - name: Save join command
+      shell: kubeadm token create --print-join-command
+      register: join
+    - copy:
+        dest: /tmp/k8s_join.sh
+        mode: '0755'
+        content: "{{ join.stdout }}"
+
+- name: 03 Join workers
+  hosts: k8s_workers
+  become: yes
+  tasks:
+    - name: Fetch join cmd from master
+      slurp:
+        src: /tmp/k8s_join.sh
+      register: join_file
+      delegate_to: k8s-master-01
+
+    - name: Join
+      shell: "{{ join_file.content | b64decode }}"
+      args: { creates: /etc/kubernetes/kubelet.conf }
+
+- name: 04 Calico network
+  hosts: k8s_master
+  become: yes
+  tasks:
+    - shell: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml
+    - shell: kubectl wait --for=condition=ready pod -l k8s-app=calico-node -n kube-system --timeout=300s
+
+- name: 05 Verify & test
+  hosts: k8s_master
+  become: yes
+  tasks:
+    - shell: kubectl get nodes -o wide
+      register: nodes
+    - debug: msg="{{ nodes.stdout }}"
+
+    - shell: |
+        kubectl create ns test --dry-run=client -o yaml | kubectl apply -f -
+        kubectl create deploy nginx-test --image=nginx:alpine -n test
+        kubectl expose deploy nginx-test --port=80 --target-port=80 -n test
+        kubectl wait --for=condition=ready pod -l app=nginx-test -n test --timeout=180s
+        kubectl get pods -n test -o wide
+      register: pods
+    - debug: msg="{{ pods.stdout }}"
