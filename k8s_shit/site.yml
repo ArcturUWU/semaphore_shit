@@ -1,10 +1,11 @@
 # site.yml — единый прогон кластера (Semaphore → Ansible)
+
 # Требуемые группы в inventory:
-#   [k8s_master]
-#   [k8s_workers]
-#   [k8s_all:children]
-#   k8s_master
-#   k8s_workers
+# [k8s_master]
+# [k8s_workers]
+# [k8s_all:children]
+# k8s_master
+# k8s_workers
 
 # ===== 01. Подготовка всех нод =====
 - name: Prepare all Kubernetes nodes
@@ -12,13 +13,14 @@
   become: yes
   gather_facts: yes
   vars:
+    # если хочешь получать kubeconfig не только для root, укажи
+    # фактическое имя своего пользователя тут или в group_vars/host_vars
     cluster_admin_user: admin
     k8s_major_minor: "v1.28"           # ветка Kubernetes для pkgs.k8s.io
     pod_network_cidr: "10.244.0.0/16"  # Calico совместим
   environment:
     DEBIAN_FRONTEND: noninteractive
   tasks:
-    # --- стабильность apt и IPv4 ---
     - name: Wait for dpkg/apt locks
       ansible.builtin.shell: |
         while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 1; done
@@ -35,7 +37,7 @@
           Acquire::http::Timeout "15";
           Acquire::https::Timeout "15";
 
-    # --- swap OFF сейчас и навсегда ---
+    # ---- SWAP OFF ----
     - name: Disable swap NOW (idempotent)
       ansible.builtin.command: swapoff -a
       changed_when: false
@@ -47,7 +49,7 @@
         regexp: '^\s*[^#].*\s+swap\s+'
         state: absent
 
-    # --- базовые пакеты ---
+    # ---- Базовые пакеты ----
     - name: Ensure base packages present
       ansible.builtin.apt:
         name:
@@ -66,7 +68,7 @@
         state: directory
         mode: '0755'
 
-    # --- Репозиторий Kubernetes (pkgs.k8s.io) ---
+    # ---- Репозиторий Kubernetes (pkgs.k8s.io) ----
     - name: Add Kubernetes GPG key (keyring)
       ansible.builtin.shell: |
         curl -fsSL https://pkgs.k8s.io/core:/stable:/{{ k8s_major_minor }}/deb/Release.key \
@@ -86,7 +88,7 @@
         cache_valid_time: 0
         force_apt_get: yes
 
-    # --- containerd из Debian, полный конфиг + CRI + systemd cgroups ---
+    # ---- containerd (из Debian), полный конфиг + CRI + systemd cgroups ----
     - name: Install containerd (Debian repo)
       ansible.builtin.apt:
         name: containerd
@@ -118,7 +120,7 @@
         state: restarted
         enabled: yes
 
-    # --- ядро/сетевые настройки для k8s ---
+    # ---- ядро/сетевые настройки ----
     - name: Persist kernel modules
       ansible.builtin.copy:
         dest: /etc/modules-load.d/k8s.conf
@@ -140,7 +142,7 @@
       ansible.builtin.shell: sysctl --system
       changed_when: false
 
-    # --- kubelet/kubeadm/kubectl ---
+    # ---- kubelet/kubeadm/kubectl ----
     - name: Install kubelet kubeadm kubectl (from pkgs.k8s.io {{ k8s_major_minor }})
       ansible.builtin.apt:
         name:
@@ -166,7 +168,7 @@
   hosts: k8s_master
   become: yes
   vars:
-    cluster_admin_user: admin
+    cluster_admin_user: "{{ cluster_admin_user | default('admin') }}"
     pod_network_cidr: "10.244.0.0/16"
   tasks:
     - name: kubeadm init (idempotent)
@@ -179,7 +181,22 @@
         creates: /etc/kubernetes/admin.conf
       register: init_out
 
-    - name: Prepare kubeconfig for {{ cluster_admin_user }}
+    # --- kubeconfig для root (всегда) ---
+    - name: Prepare kubeconfig for root
+      ansible.builtin.shell: |
+        install -d -m 0700 /root/.kube
+        cp -f /etc/kubernetes/admin.conf /root/.kube/config
+        chown root:root /root/.kube/config
+
+    # --- kubeconfig для cluster_admin_user (только если такой пользователь есть) ---
+    - name: Check if cluster_admin_user exists
+      ansible.builtin.shell: id -u {{ cluster_admin_user }}
+      register: user_exists
+      changed_when: false
+      failed_when: false
+
+    - name: Prepare kubeconfig for {{ cluster_admin_user }} (if exists)
+      when: user_exists.rc == 0
       ansible.builtin.shell: |
         install -d -m 0755 -o {{ cluster_admin_user }} -g {{ cluster_admin_user }} /home/{{ cluster_admin_user }}/.kube
         cp -f /etc/kubernetes/admin.conf /home/{{ cluster_admin_user }}/.kube/config
