@@ -13,11 +13,11 @@
   environment:
     DEBIAN_FRONTEND: noninteractive
   tasks:
-    - name: Disable swap immediately and permanently
-      shell: |
-        swapoff -a || true
-        sed -ri 's/^([^#].*\s+swap\s+)/#\1/g' /etc/fstab
-      args: { warn: false }
+    - name: Ensure no swap entries in fstab
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '^\s*[^#].*\s+swap\s+'
+        state: absent
 
     - name: Ensure base packages present
       apt:
