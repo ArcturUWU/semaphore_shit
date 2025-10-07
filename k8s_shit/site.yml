@@ -1,26 +1,55 @@
-# site.yml — единый прогон через Semaphore
-# ожидаемые группы в inventory:
-# [k8s_master], [k8s_workers], [k8s_all:children]=k8s_master,k8s_workers
+# site.yml — единый прогон кластера (Semaphore → Ansible)
+# Требуемые группы в inventory:
+#   [k8s_master]
+#   [k8s_workers]
+#   [k8s_all:children]
+#   k8s_master
+#   k8s_workers
 
-# ====== 01. PREPARE ALL NODES ======
+# ===== 01. Подготовка всех нод =====
 - name: Prepare all Kubernetes nodes
   hosts: k8s_all
   become: yes
+  gather_facts: yes
   vars:
     cluster_admin_user: admin
-    k8s_major_minor: "v1.28"             # стабильная ветка Kubernetes
-    pod_network_cidr: "10.244.0.0/16"    # под Calico/Flannel (берём 10.244.0.0/16)
+    k8s_major_minor: "v1.28"           # ветка Kubernetes для pkgs.k8s.io
+    pod_network_cidr: "10.244.0.0/16"  # Calico совместим
   environment:
     DEBIAN_FRONTEND: noninteractive
   tasks:
-    - name: Ensure no swap entries in fstab
+    # --- стабильность apt и IPv4 ---
+    - name: Wait for dpkg/apt locks
+      ansible.builtin.shell: |
+        while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 1; done
+        while fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do sleep 1; done
+      changed_when: false
+
+    - name: Force APT to use IPv4 and sane timeouts
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/99force-ipv4
+        mode: '0644'
+        content: |
+          Acquire::ForceIPv4 "true";
+          Acquire::Retries "5";
+          Acquire::http::Timeout "15";
+          Acquire::https::Timeout "15";
+
+    # --- swap OFF сейчас и навсегда ---
+    - name: Disable swap NOW (idempotent)
+      ansible.builtin.command: swapoff -a
+      changed_when: false
+      failed_when: false
+
+    - name: Remove any swap entries from /etc/fstab
       ansible.builtin.lineinfile:
         path: /etc/fstab
         regexp: '^\s*[^#].*\s+swap\s+'
         state: absent
 
+    # --- базовые пакеты ---
     - name: Ensure base packages present
-      apt:
+      ansible.builtin.apt:
         name:
           - apt-transport-https
           - ca-certificates
@@ -29,110 +58,110 @@
           - lsb-release
         state: present
         update_cache: yes
+        force_apt_get: yes
 
     - name: Ensure /etc/apt/keyrings exists
-      file:
+      ansible.builtin.file:
         path: /etc/apt/keyrings
         state: directory
         mode: '0755'
 
-    # --- Docker repo (для containerd.io) через keyring ---
-    - name: Add Docker GPG key (keyring)
-      shell: |
-        curl -fsSL https://download.docker.com/linux/debian/gpg \
-        | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-      args:
-        creates: /etc/apt/keyrings/docker.gpg
-
-    - name: Add Docker apt repository (signed-by)
-      apt_repository:
-        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian {{ ansible_distribution_release }} stable"
-        filename: docker
-        state: present
-
-    # --- Kubernetes repo pkgs.k8s.io на нужной ветке ---
+    # --- Репозиторий Kubernetes (pkgs.k8s.io) ---
     - name: Add Kubernetes GPG key (keyring)
-      shell: |
+      ansible.builtin.shell: |
         curl -fsSL https://pkgs.k8s.io/core:/stable:/{{ k8s_major_minor }}/deb/Release.key \
         | gpg --dearmor -o /etc/apt/keyrings/kubernetes.gpg
       args:
         creates: /etc/apt/keyrings/kubernetes.gpg
 
     - name: Add Kubernetes apt repository (signed-by)
-      apt_repository:
+      ansible.builtin.apt_repository:
         repo: "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] https://pkgs.k8s.io/core:/stable:/{{ k8s_major_minor }}/deb/ /"
         filename: kubernetes
         state: present
 
-    - name: Update apt cache
-      apt:
+    - name: Update apt cache (fresh)
+      ansible.builtin.apt:
         update_cache: yes
+        cache_valid_time: 0
+        force_apt_get: yes
 
-    # --- containerd ---
-    - name: Install containerd
-      apt:
-        name: containerd.io
+    # --- containerd из Debian, полный конфиг + CRI + systemd cgroups ---
+    - name: Install containerd (Debian repo)
+      ansible.builtin.apt:
+        name: containerd
         state: present
+        force_apt_get: yes
 
-    - name: Generate default containerd config if missing
-      shell: |
-        test -f /etc/containerd/config.toml || \
-        (containerd config default | tee /etc/containerd/config.toml)
+    - name: Create full default containerd config if missing
+      ansible.builtin.shell: |
+        test -f /etc/containerd/config.toml || containerd config default > /etc/containerd/config.toml
       args:
-        creates: /etc/containerd/config.toml
+        executable: /bin/bash
 
-    - name: Enforce SystemdCgroup=true in containerd
-      replace:
+    - name: Ensure SystemdCgroup=true for runc
+      ansible.builtin.replace:
         path: /etc/containerd/config.toml
         regexp: 'SystemdCgroup = false'
         replace: 'SystemdCgroup = true'
 
+    - name: Ensure CRI plugin is enabled (not disabled)
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: '^disabled_plugins = .*$'
+        replace: 'disabled_plugins = []'
+      failed_when: false
+
     - name: Enable & restart containerd
-      systemd:
+      ansible.builtin.systemd:
         name: containerd
         state: restarted
         enabled: yes
 
-    # --- kernel modules & sysctl ---
+    # --- ядро/сетевые настройки для k8s ---
     - name: Persist kernel modules
-      copy:
+      ansible.builtin.copy:
         dest: /etc/modules-load.d/k8s.conf
         content: |
           overlay
           br_netfilter
     - name: Load modules now
-      shell: modprobe overlay && modprobe br_netfilter
+      ansible.builtin.shell: modprobe overlay && modprobe br_netfilter
+      changed_when: false
 
-    - name: Persist sysctl settings for Kubernetes networking
-      copy:
+    - name: Persist sysctl settings for Kubernetes
+      ansible.builtin.copy:
         dest: /etc/sysctl.d/k8s.conf
         content: |
           net.bridge.bridge-nf-call-iptables=1
           net.bridge.bridge-nf-call-ip6tables=1
           net.ipv4.ip_forward=1
     - name: Apply sysctl
-      shell: sysctl --system
+      ansible.builtin.shell: sysctl --system
+      changed_when: false
 
     # --- kubelet/kubeadm/kubectl ---
-    - name: Install kubelet kubeadm kubectl from {{ k8s_major_minor }}
-      apt:
+    - name: Install kubelet kubeadm kubectl (from pkgs.k8s.io {{ k8s_major_minor }})
+      ansible.builtin.apt:
         name:
           - kubelet
           - kubeadm
           - kubectl
         state: present
         update_cache: yes
+        force_apt_get: yes
 
     - name: Hold k8s package versions
-      shell: apt-mark hold kubelet kubeadm kubectl
+      ansible.builtin.shell: apt-mark hold kubelet kubeadm kubectl
+      changed_when: false
 
     - name: Enable kubelet service
-      systemd:
+      ansible.builtin.systemd:
         name: kubelet
         state: started
         enabled: yes
 
-# ====== 02. INIT MASTER ======
+# ===== 02. Инициализация master =====
 - name: Initialize control-plane on master
   hosts: k8s_master
   become: yes
@@ -141,7 +170,7 @@
     pod_network_cidr: "10.244.0.0/16"
   tasks:
     - name: kubeadm init (idempotent)
-      shell: |
+      ansible.builtin.shell: |
         kubeadm init \
           --pod-network-cidr={{ pod_network_cidr }} \
           --apiserver-advertise-address={{ ansible_default_ipv4.address }} \
@@ -151,28 +180,28 @@
       register: init_out
 
     - name: Prepare kubeconfig for {{ cluster_admin_user }}
-      shell: |
+      ansible.builtin.shell: |
         install -d -m 0755 -o {{ cluster_admin_user }} -g {{ cluster_admin_user }} /home/{{ cluster_admin_user }}/.kube
         cp -f /etc/kubernetes/admin.conf /home/{{ cluster_admin_user }}/.kube/config
         chown {{ cluster_admin_user }}:{{ cluster_admin_user }} /home/{{ cluster_admin_user }}/.kube/config
 
     - name: Obtain join command (with containerd socket)
-      shell: kubeadm token create --print-join-command
+      ansible.builtin.shell: kubeadm token create --print-join-command
       register: join_cmd
 
     - name: Save join script on master
-      copy:
+      ansible.builtin.copy:
         dest: /tmp/k8s_join.sh
         mode: '0755'
         content: "{{ join_cmd.stdout }} --cri-socket unix:///run/containerd/containerd.sock"
 
     - name: Wait for API server to accept connections
-      wait_for:
+      ansible.builtin.wait_for:
         host: "{{ ansible_default_ipv4.address }}"
         port: 6443
-        timeout: 120
+        timeout: 180
 
-# ====== 03. JOIN WORKERS ======
+# ===== 03. Присоединение воркеров =====
 - name: Join worker nodes to the cluster
   hosts: k8s_workers
   become: yes
@@ -180,45 +209,49 @@
     master_host: "{{ groups['k8s_master'][0] }}"
   tasks:
     - name: Fetch join script from master
-      slurp:
+      ansible.builtin.slurp:
         src: /tmp/k8s_join.sh
       register: join_file
       delegate_to: "{{ master_host }}"
 
     - name: Run join script (idempotent via kubelet.conf)
-      shell: "{{ join_file.content | b64decode }}"
+      ansible.builtin.shell: "{{ join_file.content | b64decode }}"
       args:
         creates: /etc/kubernetes/kubelet.conf
 
-# ====== 04. CNI (CALICO) ======
+# ===== 04. Calico CNI =====
 - name: Install Calico CNI on master
   hosts: k8s_master
   become: yes
   tasks:
     - name: Apply Calico manifest
-      shell: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml
+      ansible.builtin.shell: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml
+      changed_when: false
 
     - name: Wait for calico-node to become Ready
-      shell: kubectl -n kube-system wait --for=condition=ready pod -l k8s-app=calico-node --timeout=300s
+      ansible.builtin.shell: kubectl -n kube-system wait --for=condition=ready pod -l k8s-app=calico-node --timeout=300s
+      changed_when: false
 
-# ====== 05. VERIFY (nodes + smoke test) ======
+# ===== 05. Проверка (nodes + smoke test) =====
 - name: Verify cluster and run a smoke test
   hosts: k8s_master
   become: yes
   tasks:
     - name: Show nodes (should be Ready on all)
-      shell: kubectl get nodes -o wide
+      ansible.builtin.shell: kubectl get nodes -o wide
       register: nodes
-    - debug:
+      changed_when: false
+    - ansible.builtin.debug:
         msg: "{{ nodes.stdout }}"
 
     - name: Deploy nginx in 'test' namespace and expose it
-      shell: |
+      ansible.builtin.shell: |
         kubectl create ns test --dry-run=client -o yaml | kubectl apply -f -
         kubectl create deploy nginx-test --image=nginx:alpine -n test --dry-run=client -o yaml | kubectl apply -f -
         kubectl expose deploy nginx-test --port=80 --target-port=80 -n test --dry-run=client -o yaml | kubectl apply -f -
         kubectl rollout status deploy/nginx-test -n test --timeout=180s
         kubectl get pods -n test -o wide
       register: pods
-    - debug:
+      changed_when: false
+    - ansible.builtin.debug:
         msg: "{{ pods.stdout }}"
