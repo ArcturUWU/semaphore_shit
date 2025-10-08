@@ -273,18 +273,78 @@
       args:
         creates: /etc/kubernetes/kubelet.conf
 
-# ========= 04. Calico CNI =========
-- name: Install Calico CNI on master
+# ========= 04. Calico CNI (устойчиво) =========
+- name: Install Calico CNI on master (robust)
   hosts: k8s_master
   become: yes
   tasks:
-    - name: Apply Calico manifest
-      ansible.builtin.shell: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml
+    # 1) ещё раз убеждаемся, что API стабилен
+    - name: Ensure apiserver is ready (/readyz) before CNI apply
+      ansible.builtin.shell: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        get --raw='/readyz?verbose'
+      register: readyz_before_calico
+      retries: 60
+      delay: 5
+      until: readyz_before_calico.rc == 0
       changed_when: false
 
-    - name: Wait for calico-node to become Ready
-      ansible.builtin.shell: kubectl -n kube-system wait --for=condition=ready pod -l k8s-app=calico-node --timeout=300s
+    # 2) применяем манифест с ретраями — переживаем кратковременные отказы
+    - name: Apply Calico manifest (retry on transient apiserver errors)
+      ansible.builtin.shell: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml
+      register: calico_apply
+      retries: 15
+      delay: 8
+      until: calico_apply.rc == 0
+
+    # 3) ждём, пока CRD Calico зарегистрируются
+    - name: Wait for Calico CRDs to appear
+      ansible.builtin.shell: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        api-resources | grep -q projectcalico.org
+      register: calico_crd
+      retries: 60
+      delay: 5
+      until: calico_crd.rc == 0
       changed_when: false
+
+    # 4) ждём развёртывание DaemonSet calico-node
+    - name: Wait for calico-node DaemonSet rollout
+      ansible.builtin.shell: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        -n kube-system rollout status ds/calico-node --timeout=600s
+      register: calico_rollout
+      retries: 5
+      delay: 15
+      until: calico_rollout.rc == 0
+      changed_when: false
+
+# ========= 05. Проверка (nodes + smoke test) =========
+- name: Verify cluster and run a smoke test
+  hosts: k8s_master
+  become: yes
+  tasks:
+    # после CNI ноды должны перейти в Ready
+    - name: Show nodes (should be Ready on all)
+      ansible.builtin.shell: kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes -o wide
+      register: nodes
+      changed_when: false
+    - ansible.builtin.debug:
+        msg: "{{ nodes.stdout }}"
+
+    - name: Deploy nginx in 'test' namespace and expose it
+      ansible.builtin.shell: |
+        kubectl --kubeconfig /etc/kubernetes/admin.conf create ns test --dry-run=client -o yaml | kubectl apply -f -
+        kubectl --kubeconfig /etc/kubernetes/admin.conf create deploy nginx-test --image=nginx:alpine -n test --dry-run=client -o yaml | kubectl apply -f -
+        kubectl --kubeconfig /etc/kubernetes/admin.conf expose deploy nginx-test --port=80 --target-port=80 -n test --dry-run=client -o yaml | kubectl apply -f -
+        kubectl --kubeconfig /etc/kubernetes/admin.conf rollout status deploy/nginx-test -n test --timeout=180s
+        kubectl --kubeconfig /etc/kubernetes/admin.conf get pods -n test -o wide
+      register: pods
+      changed_when: false
+    - ansible.builtin.debug:
+        msg: "{{ pods.stdout }}"
 
 # ========= 05. Проверка (nodes + smoke test) =========
 - name: Verify cluster and run a smoke test
