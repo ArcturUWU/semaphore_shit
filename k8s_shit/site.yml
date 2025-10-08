@@ -278,7 +278,7 @@
   hosts: k8s_master
   become: yes
   tasks:
-    # 1) ещё раз убеждаемся, что API стабилен
+    # 1) гарантируем, что API стабилен
     - name: Ensure apiserver is ready (/readyz) before CNI apply
       ansible.builtin.shell: >
         kubectl --kubeconfig /etc/kubernetes/admin.conf
@@ -289,7 +289,7 @@
       until: readyz_before_calico.rc == 0
       changed_when: false
 
-    # 2) применяем манифест с ретраями — переживаем кратковременные отказы
+    # 2) применяем Calico с ретраями (гасим кратковременные ошибки API)
     - name: Apply Calico manifest (retry on transient apiserver errors)
       ansible.builtin.shell: >
         kubectl --kubeconfig /etc/kubernetes/admin.conf
@@ -299,7 +299,7 @@
       delay: 8
       until: calico_apply.rc == 0
 
-    # 3) ждём, пока CRD Calico зарегистрируются
+    # 3) ждём появление CRD Calico
     - name: Wait for Calico CRDs to appear
       ansible.builtin.shell: >
         kubectl --kubeconfig /etc/kubernetes/admin.conf
@@ -310,23 +310,52 @@
       until: calico_crd.rc == 0
       changed_when: false
 
-    # 4) ждём развёртывание DaemonSet calico-node
-    - name: Wait for calico-node DaemonSet rollout
-      ansible.builtin.shell: >
-        kubectl --kubeconfig /etc/kubernetes/admin.conf
-        -n kube-system rollout status ds/calico-node --timeout=600s
-      register: calico_rollout
-      retries: 5
-      delay: 15
-      until: calico_rollout.rc == 0
+    # 4) УСТОЙЧИВО ждём rollout DaemonSet'а calico-node.
+    #    Если API "упал" → ждём/чиняем kubelet и продолжаем.
+    - name: Wait for calico-node rollout with self-heal loop
+      ansible.builtin.shell: |
+        set -e
+        # до 30 итераций по 10 сек = ~5 минут; при необходимости повышай значения
+        for i in $(seq 1 30); do
+          if kubectl --kubeconfig /etc/kubernetes/admin.conf get --raw='/readyz?verbose' >/dev/null 2>&1; then
+            if kubectl --kubeconfig /etc/kubernetes/admin.conf -n kube-system rollout status ds/calico-node --timeout=60s >/dev/null 2>&1; then
+              echo "calico-node rolled out"
+              exit 0
+            fi
+          else
+            # kube-apiserver недоступен — убедимся, что kubelet активен
+            systemctl is-active kubelet >/dev/null 2>&1 || systemctl restart kubelet || true
+          fi
+          sleep 10
+        done
+        echo "calico-node rollout not finished or apiserver unstable" >&2
+        exit 1
+      register: calico_rollout_loop
       changed_when: false
+
+    # 5) диагностический вывод на будущее
+    - name: Show kube-system pods (diagnostic)
+      ansible.builtin.shell: kubectl --kubeconfig /etc/kubernetes/admin.conf -n kube-system get pods -o wide
+      register: ks_pods
+      changed_when: false
+    - ansible.builtin.debug:
+        msg: "{{ ks_pods.stdout }}"
 
 # ========= 05. Проверка (nodes + smoke test) =========
 - name: Verify cluster and run a smoke test
   hosts: k8s_master
   become: yes
   tasks:
-    # после CNI ноды должны перейти в Ready
+    - name: Ensure apiserver is ready before verification
+      ansible.builtin.shell: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        get --raw='/readyz?verbose'
+      register: readyz_verify
+      retries: 60
+      delay: 5
+      until: readyz_verify.rc == 0
+      changed_when: false
+
     - name: Show nodes (should be Ready on all)
       ansible.builtin.shell: kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes -o wide
       register: nodes
@@ -341,30 +370,6 @@
         kubectl --kubeconfig /etc/kubernetes/admin.conf expose deploy nginx-test --port=80 --target-port=80 -n test --dry-run=client -o yaml | kubectl apply -f -
         kubectl --kubeconfig /etc/kubernetes/admin.conf rollout status deploy/nginx-test -n test --timeout=180s
         kubectl --kubeconfig /etc/kubernetes/admin.conf get pods -n test -o wide
-      register: pods
-      changed_when: false
-    - ansible.builtin.debug:
-        msg: "{{ pods.stdout }}"
-
-# ========= 05. Проверка (nodes + smoke test) =========
-- name: Verify cluster and run a smoke test
-  hosts: k8s_master
-  become: yes
-  tasks:
-    - name: Show nodes (should be Ready on all)
-      ansible.builtin.shell: kubectl get nodes -o wide
-      register: nodes
-      changed_when: false
-    - ansible.builtin.debug:
-        msg: "{{ nodes.stdout }}"
-
-    - name: Deploy nginx in 'test' namespace and expose it
-      ansible.builtin.shell: |
-        kubectl create ns test --dry-run=client -o yaml | kubectl apply -f -
-        kubectl create deploy nginx-test --image=nginx:alpine -n test --dry-run=client -o yaml | kubectl apply -f -
-        kubectl expose deploy nginx-test --port=80 --target-port=80 -n test --dry-run=client -o yaml | kubectl apply -f -
-        kubectl rollout status deploy/nginx-test -n test --timeout=180s
-        kubectl get pods -n test -o wide
       register: pods
       changed_when: false
     - ansible.builtin.debug:
