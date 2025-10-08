@@ -1,4 +1,4 @@
-# site.yml — полный разворот кластера через Ansible/Semaphore
+# site.yml — полный разворот Kubernetes через Ansible/Semaphore
 # Ожидаемые группы в inventory:
 #   [k8s_master]
 #   [k8s_workers]
@@ -45,7 +45,7 @@
         regexp: '^\s*[^#].*\s+swap\s+'
         state: absent
 
-    # ---- Базовые пакеты ----
+    # ---- Базовые пакеты + утилиты, требуемые kubeadm/kubelet ----
     - name: Ensure base packages present
       ansible.builtin.apt:
         name:
@@ -54,6 +54,10 @@
           - curl
           - gnupg
           - lsb-release
+          - iproute2
+          - iptables
+          - conntrack
+          - socat
         state: present
         update_cache: yes
         force_apt_get: yes
@@ -161,21 +165,55 @@
         state: started
         enabled: yes
 
-# ========= 02. Инициализация master =========
+    # ---- pre-pull control-plane images (резко снижает «долгий 6443») ----
+    - name: Detect kubeadm short version
+      ansible.builtin.shell: kubeadm version -o short
+      register: kvers
+      changed_when: false
+
+    - name: Pre-pull control plane images (with retries)
+      ansible.builtin.shell: >
+        kubeadm config images pull
+        --kubernetes-version {{ kvers.stdout }}
+        --cri-socket unix:///run/containerd/containerd.sock
+      register: pullres
+      retries: 6
+      delay: 20
+      until: pullres.rc == 0
+      changed_when: false
+
+# ========= 02. Инициализация master (с автолечением) =========
 - name: Initialize control-plane on master
   hosts: k8s_master
   become: yes
   vars:
     pod_network_cidr: "10.244.0.0/16"
   tasks:
-    - name: kubeadm init (idempotent)
+    - name: Check if admin.conf exists
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: adminconf
+
+    - name: If admin.conf exists — probe /readyz
+      ansible.builtin.shell: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        get --raw='/readyz?verbose'
+      register: pre_readyz
+      when: adminconf.stat.exists
+      failed_when: false
+      changed_when: false
+
+    - name: Reset broken/half-initialized control-plane
+      ansible.builtin.shell: kubeadm reset -f
+      when: adminconf.stat.exists and pre_readyz.rc != 0
+
+    - name: kubeadm init (only if fresh or after reset)
       ansible.builtin.shell: |
         kubeadm init \
           --pod-network-cidr={{ pod_network_cidr }} \
           --apiserver-advertise-address={{ ansible_default_ipv4.address }} \
           --cri-socket unix:///run/containerd/containerd.sock
-      args:
-        creates: /etc/kubernetes/admin.conf
+      when: (not adminconf.stat.exists) or (pre_readyz.rc != 0)
 
     # kubeconfig всегда для root
     - name: Prepare kubeconfig for root
@@ -184,12 +222,12 @@
         cp -f /etc/kubernetes/admin.conf /root/.kube/config
         chown root:root /root/.kube/config
 
-    # Готовность API по-настоящему: порт + /readyz
+    # Ждём реальную готовность API
     - name: Wait for API server TCP port (6443)
       ansible.builtin.wait_for:
         host: "{{ ansible_default_ipv4.address }}"
         port: 6443
-        timeout: 600
+        timeout: 900
 
     - name: Wait until apiserver is really ready (/readyz)
       ansible.builtin.shell: >
