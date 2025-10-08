@@ -1,18 +1,18 @@
-# site.yml — единый прогон кластера (Semaphore → Ansible)
-# Инвентарь должен иметь группы:
-# [k8s_master]
-# [k8s_workers]
-# [k8s_all:children]
-# k8s_master
-# k8s_workers
+# site.yml — полный разворот кластера через Ansible/Semaphore
+# Ожидаемые группы в inventory:
+#   [k8s_master]
+#   [k8s_workers]
+#   [k8s_all:children]
+#   k8s_master
+#   k8s_workers
 
-# ===== 01. Подготовка всех нод =====
+# ========= 01. Подготовка всех нод =========
 - name: Prepare all Kubernetes nodes
   hosts: k8s_all
   become: yes
   gather_facts: yes
   vars:
-    k8s_major_minor: "v1.28"           # версия ветки Kubernetes на pkgs.k8s.io
+    k8s_major_minor: "v1.28"           # ветка Kubernetes на pkgs.k8s.io
     pod_network_cidr: "10.244.0.0/16"  # сеть подов (Calico)
   environment:
     DEBIAN_FRONTEND: noninteractive
@@ -161,7 +161,7 @@
         state: started
         enabled: yes
 
-# ===== 02. Инициализация master =====
+# ========= 02. Инициализация master =========
 - name: Initialize control-plane on master
   hosts: k8s_master
   become: yes
@@ -176,7 +176,6 @@
           --cri-socket unix:///run/containerd/containerd.sock
       args:
         creates: /etc/kubernetes/admin.conf
-      register: init_out
 
     # kubeconfig всегда для root
     - name: Prepare kubeconfig for root
@@ -185,31 +184,32 @@
         cp -f /etc/kubernetes/admin.conf /root/.kube/config
         chown root:root /root/.kube/config
 
-    # если хочешь ещё копию для «своего» пользователя — задавай переменную cluster_admin_user в inventory
-    - name: Compute effective_admin_user if provided
-      ansible.builtin.set_fact:
-        effective_admin_user: "{{ cluster_admin_user }}"
-      when: cluster_admin_user is defined and (cluster_admin_user | string | length) > 0
+    # Готовность API по-настоящему: порт + /readyz
+    - name: Wait for API server TCP port (6443)
+      ansible.builtin.wait_for:
+        host: "{{ ansible_default_ipv4.address }}"
+        port: 6443
+        timeout: 600
 
-    - name: Check if effective_admin_user exists
-      ansible.builtin.shell: id -u {{ effective_admin_user }}
-      register: user_exists
+    - name: Wait until apiserver is really ready (/readyz)
+      ansible.builtin.shell: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        get --raw='/readyz?verbose'
+      register: readyz
+      retries: 60
+      delay: 5
+      until: readyz.rc == 0
       changed_when: false
-      failed_when: false
-      when: effective_admin_user is defined
 
-    - name: Prepare kubeconfig for {{ effective_admin_user }} (if exists)
-      when:
-        - effective_admin_user is defined
-        - user_exists.rc == 0
-      ansible.builtin.shell: |
-        install -d -m 0755 -o {{ effective_admin_user }} -g {{ effective_admin_user }} /home/{{ effective_admin_user }}/.kube
-        cp -f /etc/kubernetes/admin.conf /home/{{ effective_admin_user }}/.kube/config
-        chown {{ effective_admin_user }}:{{ effective_admin_user }} /home/{{ effective_admin_user }}/.kube/config
-
-    - name: Obtain join command (with containerd socket)
-      ansible.builtin.shell: kubeadm token create --print-join-command
+    - name: Obtain join command (with retries)
+      ansible.builtin.shell: >
+        kubeadm token create
+        --kubeconfig /etc/kubernetes/admin.conf
+        --print-join-command
       register: join_cmd
+      retries: 20
+      delay: 6
+      until: join_cmd.rc == 0
 
     - name: Save join script on master
       ansible.builtin.copy:
@@ -217,13 +217,7 @@
         mode: '0755'
         content: "{{ join_cmd.stdout }} --cri-socket unix:///run/containerd/containerd.sock"
 
-    - name: Wait for API server to accept connections
-      ansible.builtin.wait_for:
-        host: "{{ ansible_default_ipv4.address }}"
-        port: 6443
-        timeout: 180
-
-# ===== 03. Присоединение воркеров =====
+# ========= 03. Присоединение воркеров =========
 - name: Join worker nodes to the cluster
   hosts: k8s_workers
   become: yes
@@ -241,7 +235,7 @@
       args:
         creates: /etc/kubernetes/kubelet.conf
 
-# ===== 04. Calico CNI =====
+# ========= 04. Calico CNI =========
 - name: Install Calico CNI on master
   hosts: k8s_master
   become: yes
@@ -254,7 +248,7 @@
       ansible.builtin.shell: kubectl -n kube-system wait --for=condition=ready pod -l k8s-app=calico-node --timeout=300s
       changed_when: false
 
-# ===== 05. Проверка (nodes + smoke test) =====
+# ========= 05. Проверка (nodes + smoke test) =========
 - name: Verify cluster and run a smoke test
   hosts: k8s_master
   become: yes
